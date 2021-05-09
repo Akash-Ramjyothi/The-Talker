@@ -1,3 +1,4 @@
+![talker_icon](https://user-images.githubusercontent.com/54114888/117578618-d4a15980-b10c-11eb-95a9-1a120484adfd.png)
 # The Talker
 
 ## 📑 Description:
@@ -20,3 +21,16 @@ https://user-images.githubusercontent.com/54114888/117577713-868a5700-b108-11eb-
 
 ## 🌐 Reference Used:
 https://www.sitepoint.com/create-text-to-speech-chrome-extension/
+
+## 🧪 Steps to Use/ Test the extension:
+
+- Download and Unzip the file.
+- Choose the type of test device you need:
+    Apps—Sign in to your Google Account on a Chrome device.
+    Extensions—Sign in to your Google Account on a Chrome device or Chrome Browser on a Windows®, Mac®, or Linux® computer.
+- Save the app or extension folder on your test device.
+- Go to chrome://extensions/.
+- At the top right, turn on Developer mode.
+- Click Load unpacked.
+- Find and select the app or extension folder.
+- Open a new tab in Chromeand thenclick Appsand thenclick the app or extension. Make sure it loads and works correctly.
