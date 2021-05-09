@@ -33,4 +33,4 @@ https://www.sitepoint.com/create-text-to-speech-chrome-extension/
 - At the top right, turn on Developer mode.
 - Click Load unpacked.
 - Find and select the app or extension folder.
-- Open a new tab in Chromeand thenclick Appsand thenclick the app or extension. Make sure it loads and works correctly.
+- Open a new tab in Chromeand thenclick Appsand thenclick the app or extension. Make sure it loads and works correctly. 
