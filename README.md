@@ -4,6 +4,9 @@
 ## 📑 Description:
 "The Talker" is a Chrome Extension to narrate texts from a webpage through speech. Even a selected text from a webpage can be specifically narrated. It works on text-to-speech principle.
 
+## 🌳 Social-Welfare Usecase:
+This project increases the accessibility of online content for those with visual impairments or reading difficulties and it facilitates access for a larger percentage of the online population, including those whose native language is different from the language of a particular website or mobile app.
+
 ## 📽 Sample Demo:
 https://user-images.githubusercontent.com/54114888/117577713-868a5700-b108-11eb-8e60-be1c864354dc.mp4
 
