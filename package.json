@@ -1,26 +1,49 @@
 {
-  "name": "read-aloud",
-  "version": "1.0.0",
-  "description": "A Chrome extension that reads aloud the webpage's content with just one click. Support 40+ languages.",
-  "directories": {
-    "doc": "docs"
-  },
-  "scripts": {
-    "package": "zip -u -r build/package.zip _locales css img js sound *.html manifest.json || true",
-    "sync-page-scripts": "rsync -avz js/messaging.js page-scripts/ && aws s3 sync --profile s3 --delete --metadata-directive REPLACE --cache-control max-age=86400,public page-scripts s3://lsdsoftware-assets/read-aloud/page-scripts"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/ken107/read-aloud.git"
-  },
-  "keywords": [
-    "text-to-speech",
-    "chrome-extension"
-  ],
-  "author": "Hai Phan <hai.phan@gmail.com>",
-  "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/ken107/read-aloud/issues"
-  },
-  "homepage": "https://readaloud.app"
+"name": "read-aloud",
+"version": "1.1.0",
+"description": "A powerful and lightweight Chrome extension that instantly reads aloud webpage content with natural-sounding text-to-speech voices. Supports 40+ languages, customizable playback controls, and seamless accessibility features for an enhanced web browsing experience.",
+"directories": {
+"doc": "docs",
+"test": "tests",
+"assets": "assets"
+},
+"scripts": {
+"start": "echo 'Launching Read Aloud extension in development mode...'",
+"lint": "eslint js/**/*.js page-scripts/**/*.js",
+"format": "prettier --write "**/*.{js,json,html,css,md}"",
+"test": "echo 'No automated tests configured yet'",
+"build": "npm run lint && npm run package",
+"package": "zip -u -r build/package.zip _locales css img js sound page-scripts *.html manifest.json README.md LICENSE || true",
+"clean": "rm -rf build/package.zip",
+"sync-page-scripts": "rsync -avz js/messaging.js page-scripts/ && aws s3 sync --profile s3 --delete --metadata-directive REPLACE --cache-control max-age=86400,public page-scripts s3://lsdsoftware-assets/read-aloud/page-scripts",
+"prepare-release": "npm run format && npm run lint && npm run build"
+},
+"repository": {
+"type": "git",
+"url": "git+https://github.com/ken107/read-aloud.git"
+},
+"keywords": [
+"text-to-speech",
+"chrome-extension",
+"accessibility",
+"speech-synthesis",
+"screen-reader",
+"language-support",
+"web-reader",
+"tts"
+],
+"author": {
+"name": "Hai Phan",
+"email": "[hai.phan@gmail.com](mailto:hai.phan@gmail.com)"
+},
+"contributors": [],
+"license": "MIT",
+"bugs": {
+"url": "https://github.com/ken107/read-aloud/issues"
+},
+"homepage": "https://readaloud.app",
+"engines": {
+"node": ">=18.0.0"
+},
+"private": false
 }
