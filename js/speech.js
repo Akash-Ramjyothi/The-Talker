@@ -1,367 +1,678 @@
+/**
+ * Enhanced Speech Synthesis Engine with Multi-Provider Support
+ * Supports: Browser TTS, Google Translate, Google Wavenet, Amazon Polly, IBM Watson
+ * @version 2.0.0
+ */
 
-function Speech(texts, options) {
-  options.rate = (options.rate || 1) * (isGoogleNative(options.voice) ? 0.9 : 1);
+class Speech {
+  constructor(texts, options = {}) {
+    this.options = {
+      rate: 1.0,
+      pitch: 1.0,
+      volume: 1.0,
+      lang: 'en-US',
+      voice: null,
+      onStart: null,
+      onEnd: null,
+      onError: null,
+      onBoundary: null,
+      ...options
+    };
 
-  for (var i=0; i<texts.length; i++) if (/[\w)]$/.test(texts[i])) texts[i] += '.';
-  if (texts.length) texts = getChunks(texts.join("\n\n"));
-
-  var self = this;
-  var engine;
-  var pauseDuration = 650/options.rate;
-  var state = "IDLE";
-  var index = 0;
-  var delayedPlayTimer;
-  var ready = Promise.resolve(pickEngine())
-    .then(function(x) {
-      engine = x;
-    })
-
-  this.options = options;
-  this.play = play;
-  this.pause = pause;
-  this.stop = stop;
-  this.getState = getState;
-  this.getPosition = getPosition;
-  this.forward = forward;
-  this.rewind = rewind;
-  this.seek = seek;
-  this.gotoEnd = gotoEnd;
-
-  function pickEngine() {
-    if (isGoogleTranslate(options.voice) && !/\s(Hebrew|Telugu)$/.test(options.voice.voiceName)) {
-      return googleTranslateTtsEngine.ready()
-        .then(function() {return googleTranslateTtsEngine})
-        .catch(function(err) {
-          console.error(err);
-          options.voice.autoSelect = true;
-          return remoteTtsEngine;
-        })
+    // Apply rate adjustment for Google Native voices
+    if (this.options.voice && this.isGoogleNative(this.options.voice)) {
+      this.options.rate = (this.options.rate || 1) * 0.9;
     }
-    if (isAmazonPolly(options.voice)) return amazonPollyTtsEngine;
-    if (isGoogleWavenet(options.voice)) return googleWavenetTtsEngine;
-    if (isIbmWatson(options.voice)) return ibmWatsonTtsEngine;
-    if (isRemoteVoice(options.voice)) return remoteTtsEngine;
-    if (isGoogleNative(options.voice)) return new TimeoutTtsEngine(browserTtsEngine, 16*1000);
-    return browserTtsEngine;
+
+    // Normalize texts with proper punctuation
+    this.texts = this.normalizeTexts(Array.isArray(texts) ? texts : [texts]);
+    
+    // Split into manageable chunks
+    if (this.texts.length) {
+      this.texts = this.getChunks(this.texts.join('\n\n'));
+    }
+
+    this.state = 'IDLE';
+    this.currentIndex = 0;
+    this.pauseDuration = 650 / this.options.rate;
+    this.delayedPlayTimer = null;
+    this.engine = null;
+    this.startTime = null;
+    
+    // Initialize engine asynchronously
+    this.ready = this.initEngine();
   }
 
-  function getChunks(text) {
-    var isEA = /^zh|ko|ja/.test(options.lang);
-    var punctuator = isEA ? new EastAsianPunctuator() : new LatinPunctuator();
-    if (isGoogleNative(options.voice)) {
-      var wordLimit = (/^(de|ru|es|id)/.test(options.lang) ? 32 : 36) * (isEA ? 2 : 1) * options.rate;
+  // Public API
+  async play() {
+    if (this.currentIndex >= this.texts.length) {
+      this.state = 'IDLE';
+      this.options.onEnd?.();
+      return;
+    }
+
+    if (this.state === 'PAUSED') {
+      this.state = 'PLAYING';
+      await this.engine.resume();
+      return;
+    }
+
+    this.state = 'PLAYING';
+    this.startTime = Date.now();
+    
+    await this.ready;
+    await this.speakChunk();
+  }
+
+  async pause() {
+    await this.ready;
+    
+    if (this.canPause()) {
+      clearTimeout(this.delayedPlayTimer);
+      await this.engine.pause();
+      this.state = 'PAUSED';
+    } else {
+      await this.stop();
+    }
+  }
+
+  async stop() {
+    await this.ready;
+    clearTimeout(this.delayedPlayTimer);
+    await this.engine.stop();
+    this.state = 'IDLE';
+    this.currentIndex = 0;
+  }
+
+  async forward() {
+    if (this.currentIndex + 1 < this.texts.length) {
+      this.currentIndex++;
+      return this.delayedPlay();
+    }
+    throw new Error('Cannot forward: already at end');
+  }
+
+  async rewind() {
+    if (this.state === 'PLAYING' && Date.now() - this.startTime > 3000) {
+      await this.stop();
+      return this.play();
+    }
+    
+    if (this.currentIndex > 0) {
+      this.currentIndex--;
+      await this.stop();
+      return this.play();
+    }
+    
+    throw new Error('Cannot rewind: already at beginning');
+  }
+
+  async seek(index) {
+    if (index >= 0 && index < this.texts.length) {
+      this.currentIndex = index;
+      await this.stop();
+      return this.play();
+    }
+    throw new Error(`Invalid seek index: ${index}`);
+  }
+
+  gotoEnd() {
+    this.currentIndex = Math.max(0, this.texts.length - 1);
+  }
+
+  getState() {
+    if (!this.engine) return 'LOADING';
+    
+    return new Promise((resolve) => {
+      this.engine.isSpeaking((isSpeaking) => {
+        if (this.state === 'PLAYING') {
+          resolve(isSpeaking ? 'PLAYING' : 'LOADING');
+        } else {
+          resolve('PAUSED');
+        }
+      });
+    });
+  }
+
+  getPosition() {
+    return {
+      index: this.currentIndex,
+      total: this.texts.length,
+      progress: this.currentIndex / this.texts.length,
+      texts: this.texts
+    };
+  }
+
+  // Private methods
+  async initEngine() {
+    const engine = await this.pickEngine();
+    this.engine = engine;
+    return engine;
+  }
+
+  async pickEngine() {
+    const voice = this.options.voice;
+    
+    if (!voice) {
+      return this.createBrowserEngine();
+    }
+    
+    if (this.isGoogleTranslate(voice) && !/\s(Hebrew|Telugu)$/.test(voice.voiceName)) {
+      try {
+        await googleTranslateTtsEngine.ready();
+        return googleTranslateTtsEngine;
+      } catch (err) {
+        console.error('Google Translate TTS failed:', err);
+        this.options.voice.autoSelect = true;
+        return this.createRemoteEngine();
+      }
+    }
+    
+    if (this.isAmazonPolly(voice)) return amazonPollyTtsEngine;
+    if (this.isGoogleWavenet(voice)) return googleWavenetTtsEngine;
+    if (this.isIbmWatson(voice)) return ibmWatsonTtsEngine;
+    if (this.isRemoteVoice(voice)) return this.createRemoteEngine();
+    if (this.isGoogleNative(voice)) {
+      return new TimeoutTtsEngine(this.createBrowserEngine(), 16000);
+    }
+    
+    return this.createBrowserEngine();
+  }
+
+  createBrowserEngine() {
+    return new BrowserTtsEngine(window.speechSynthesis);
+  }
+
+  createRemoteEngine() {
+    return remoteTtsEngine;
+  }
+
+  normalizeTexts(texts) {
+    return texts.map(text => {
+      // Ensure sentences end with punctuation
+      if (/[\w)]$/.test(text)) {
+        return text + '.';
+      }
+      return text;
+    });
+  }
+
+  getChunks(text) {
+    const isEA = /^zh|ko|ja/.test(this.options.lang);
+    const punctuator = isEA ? new EastAsianPunctuator() : new LatinPunctuator();
+    
+    if (this.isGoogleNative(this.options.voice)) {
+      const wordLimit = (/^(de|ru|es|id)/.test(this.options.lang) ? 32 : 36) * (isEA ? 2 : 1) * this.options.rate;
       return new WordBreaker(wordLimit, punctuator).breakText(text);
     }
-    else {
-      if (isGoogleTranslate(options.voice)) return new CharBreaker(200, punctuator).breakText(text);
-      else return new CharBreaker(750, punctuator, 200).breakText(text);
+    
+    if (this.isGoogleTranslate(this.options.voice)) {
+      return new CharBreaker(200, punctuator).breakText(text);
+    }
+    
+    return new CharBreaker(750, punctuator, 200).breakText(text);
+  }
+
+  async speakChunk() {
+    const text = this.texts[this.currentIndex];
+    
+    // Prefetch next chunk for smoother playback
+    if (this.texts[this.currentIndex + 1] && this.engine.prefetch) {
+      this.engine.prefetch(this.texts[this.currentIndex + 1], this.options);
+    }
+    
+    try {
+      await this.speak(text);
+      
+      // Schedule next chunk
+      if (this.engine.setNextStartTime) {
+        this.engine.setNextStartTime(Date.now() + this.pauseDuration, this.options);
+      }
+      
+      this.currentIndex++;
+      await this.play();
+    } catch (error) {
+      this.state = 'IDLE';
+      this.options.onError?.(error);
     }
   }
 
-  function getState() {
-    if (!engine) return "LOADING";
-    return new Promise(function(fulfill) {
-      engine.isSpeaking(function(isSpeaking) {
-        if (state == "PLAYING") fulfill(isSpeaking ? "PLAYING" : "LOADING");
-        else fulfill("PAUSED");
-      })
-    })
-  }
-
-  function getPosition() {
-    return {
-      index: index,
-      texts: texts,
-    }
-  }
-
-  function play() {
-    if (index >= texts.length) {
-      state = "IDLE";
-      if (self.onEnd) self.onEnd();
-      return Promise.resolve();
-    }
-    else if (state == "PAUSED") {
-      state = "PLAYING";
-      engine.resume();
-      return Promise.resolve();
-    }
-    else {
-      state = new String("PLAYING");
-      state.startTime = new Date().getTime();
-      return ready
-        .then(function() {
-          return speak(texts[index],
-            function() {
-              state = "IDLE";
-              if (engine.setNextStartTime) engine.setNextStartTime(new Date().getTime() + pauseDuration, options);
-              index++;
-              play();
-            },
-            function(err) {
-              state = "IDLE";
-              if (self.onEnd) self.onEnd(err);
-            })
-        })
-        .then(function() {
-          if (texts[index+1] && engine.prefetch) engine.prefetch(texts[index+1], options);
-        })
-    }
-  }
-
-  function delayedPlay() {
-    clearTimeout(delayedPlayTimer);
-    delayedPlayTimer = setTimeout(function() {stop().then(play)}, 750);
-    return Promise.resolve();
-  }
-
-  function canPause() {
-    return engine.pause && !(
-      isChromeOSNative(options.voice) ||
-      options.voice.voiceName == "US English Female TTS (by Google)"
-    )
-  }
-
-  function pause() {
-    return ready
-      .then(function() {
-        if (canPause()) {
-          clearTimeout(delayedPlayTimer);
-          engine.pause();
-          state = "PAUSED";
+  speak(text) {
+    return new Promise((resolve, reject) => {
+      let speakState = 'IDLE';
+      
+      this.engine.speak(text, this.options, (event) => {
+        switch (event.type) {
+          case 'start':
+            if (speakState === 'IDLE') {
+              this.options.onStart?.();
+              speakState = 'STARTED';
+              resolve();
+            }
+            break;
+            
+          case 'end':
+            if (speakState === 'IDLE') {
+              reject(new Error('TTS engine end event before start event'));
+            } else if (speakState === 'STARTED') {
+              this.options.onEnd?.();
+              speakState = 'ENDED';
+            }
+            break;
+            
+          case 'boundary':
+            this.options.onBoundary?.(event);
+            break;
+            
+          case 'error':
+            if (speakState === 'IDLE') {
+              reject(new Error(event.errorMessage || 'Unknown TTS error'));
+            } else if (speakState === 'STARTED') {
+              this.options.onError?.(new Error(event.errorMessage || 'Unknown TTS error'));
+            }
+            speakState = 'ERROR';
+            break;
         }
-        else return stop();
-      })
+      });
+    });
   }
 
-  function stop() {
-    return ready
-      .then(function() {
-        clearTimeout(delayedPlayTimer);
-        engine.stop();
-        state = "IDLE";
-      })
+  delayedPlay() {
+    clearTimeout(this.delayedPlayTimer);
+    this.delayedPlayTimer = setTimeout(async () => {
+      await this.stop();
+      await this.play();
+    }, 750);
   }
 
-  function forward() {
-    if (index+1 < texts.length) {
-      index++;
-      return delayedPlay();
+  canPause() {
+    return this.engine?.pause && !(
+      this.isChromeOSNative(this.options.voice) ||
+      this.options.voice?.voiceName === 'US English Female TTS (by Google)'
+    );
+  }
+
+  // Voice detection helpers
+  isGoogleTranslate(voice) {
+    return voice?.provider === 'google-translate';
+  }
+
+  isGoogleWavenet(voice) {
+    return voice?.provider === 'google-wavenet';
+  }
+
+  isGoogleNative(voice) {
+    return voice?.provider === 'google-native';
+  }
+
+  isAmazonPolly(voice) {
+    return voice?.provider === 'amazon-polly';
+  }
+
+  isIbmWatson(voice) {
+    return voice?.provider === 'ibm-watson';
+  }
+
+  isRemoteVoice(voice) {
+    return voice?.remote === true;
+  }
+
+  isChromeOSNative(voice) {
+    return voice?.platform === 'chromeos';
+  }
+}
+
+// Enhanced Text Breakers with better language support
+class WordBreaker {
+  constructor(wordLimit, punctuator) {
+    this.wordLimit = wordLimit;
+    this.punctuator = punctuator;
+  }
+
+  breakText(text) {
+    return this.merge(
+      this.punctuator.getParagraphs(text),
+      (p) => this.breakParagraph(p)
+    );
+  }
+
+  breakParagraph(text) {
+    return this.merge(
+      this.punctuator.getSentences(text),
+      (s) => this.breakSentence(s)
+    );
+  }
+
+  breakSentence(sentence) {
+    return this.merge(
+      this.punctuator.getPhrases(sentence),
+      (p) => this.breakPhrase(p)
+    );
+  }
+
+  breakPhrase(phrase) {
+    const words = this.punctuator.getWords(phrase);
+    const splitPoint = Math.min(Math.ceil(words.length / 2), this.wordLimit);
+    const result = [];
+    
+    for (let i = 0; i < words.length; i += splitPoint) {
+      result.push(words.slice(i, i + splitPoint).join(''));
     }
-    else return Promise.reject(new Error("Can't forward, at end"));
-  }
-
-  function rewind() {
-    if (state == "PLAYING" && new Date().getTime()-state.startTime > 3*1000) {
-      return stop().then(play);
-    }
-    else if (index > 0) {
-      index--;
-      return stop().then(play);
-    }
-    else return Promise.reject(new Error("Can't rewind, at beginning"));
-  }
-
-  function seek(n) {
-    index = n;
-    return play();
-  }
-
-  function gotoEnd() {
-    index = texts.length && texts.length-1;
-  }
-
-  function speak(text, onEnd, onError) {
-    var state = "IDLE";
-    return new Promise(function(fulfill, reject) {
-      engine.speak(text, options, function(event) {
-        if (event.type == "start") {
-          if (state == "IDLE") {
-            fulfill();
-            state = "STARTED";
-          }
-        }
-        else if (event.type == "end") {
-          if (state == "IDLE") {
-            reject(new Error("TTS engine end event before start event"));
-            state = "ERROR";
-          }
-          else if (state == "STARTED") {
-            onEnd();
-            state = "ENDED";
-          }
-        }
-        else if (event.type == "error") {
-          if (state == "IDLE") {
-            reject(new Error(event.errorMessage || "Unknown TTS error"));
-            state = "ERROR";
-          }
-          else if (state == "STARTED") {
-            onError(new Error(event.errorMessage || "Unknown TTS error"));
-            state = "ERROR";
-          }
-        }
-      })
-    })
-  }
-
-
-//text breakers
-
-function WordBreaker(wordLimit, punctuator) {
-  this.breakText = breakText;
-  function breakText(text) {
-    return merge(punctuator.getParagraphs(text), breakParagraph);
-  }
-  function breakParagraph(text) {
-    return merge(punctuator.getSentences(text), breakSentence);
-  }
-  function breakSentence(sentence) {
-    return merge(punctuator.getPhrases(sentence), breakPhrase);
-  }
-  function breakPhrase(phrase) {
-    var words = punctuator.getWords(phrase);
-    var splitPoint = Math.min(Math.ceil(words.length/2), wordLimit);
-    var result = [];
-    while (words.length) {
-      result.push(words.slice(0, splitPoint).join(""));
-      words = words.slice(splitPoint);
-    }
+    
     return result;
   }
-  function merge(parts, breakPart) {
-    var result = [];
-    var group = {parts: [], wordCount: 0};
-    var flush = function() {
+
+  merge(parts, breakPart) {
+    const result = [];
+    let group = { parts: [], wordCount: 0 };
+    
+    const flush = () => {
       if (group.parts.length) {
-        result.push(group.parts.join(""));
-        group = {parts: [], wordCount: 0};
+        result.push(group.parts.join(''));
+        group = { parts: [], wordCount: 0 };
       }
     };
-    parts.forEach(function(part) {
-      var wordCount = punctuator.getWords(part).length;
-      if (wordCount > wordLimit) {
+    
+    for (const part of parts) {
+      const wordCount = this.punctuator.getWords(part).length;
+      
+      if (wordCount > this.wordLimit) {
         flush();
-        var subParts = breakPart(part);
-        for (var i=0; i<subParts.length; i++) result.push(subParts[i]);
-      }
-      else {
-        if (group.wordCount + wordCount > wordLimit) flush();
+        const subParts = breakPart(part);
+        result.push(...subParts);
+      } else {
+        if (group.wordCount + wordCount > this.wordLimit) flush();
         group.parts.push(part);
         group.wordCount += wordCount;
       }
-    });
+    }
+    
     flush();
     return result;
   }
 }
 
-function CharBreaker(charLimit, punctuator, paragraphCombineThreshold) {
-  this.breakText = breakText;
-  function breakText(text) {
-    return merge(punctuator.getParagraphs(text), breakParagraph, paragraphCombineThreshold);
+class CharBreaker {
+  constructor(charLimit, punctuator, paragraphCombineThreshold = null) {
+    this.charLimit = charLimit;
+    this.punctuator = punctuator;
+    this.paragraphCombineThreshold = paragraphCombineThreshold;
   }
-  function breakParagraph(text) {
-    return merge(punctuator.getSentences(text), breakSentence);
+
+  breakText(text) {
+    return this.merge(
+      this.punctuator.getParagraphs(text),
+      (p) => this.breakParagraph(p),
+      this.paragraphCombineThreshold
+    );
   }
-  function breakSentence(sentence) {
-    return merge(punctuator.getPhrases(sentence), breakPhrase);
+
+  breakParagraph(text) {
+    return this.merge(
+      this.punctuator.getSentences(text),
+      (s) => this.breakSentence(s)
+    );
   }
-  function breakPhrase(phrase) {
-    return merge(punctuator.getWords(phrase), breakWord);
+
+  breakSentence(sentence) {
+    return this.merge(
+      this.punctuator.getPhrases(sentence),
+      (p) => this.breakPhrase(p)
+    );
   }
-  function breakWord(word) {
-    var result = [];
-    while (word) {
-      result.push(word.slice(0, charLimit));
-      word = word.slice(charLimit);
+
+  breakPhrase(phrase) {
+    return this.merge(
+      this.punctuator.getWords(phrase),
+      (w) => this.breakWord(w)
+    );
+  }
+
+  breakWord(word) {
+    const result = [];
+    for (let i = 0; i < word.length; i += this.charLimit) {
+      result.push(word.slice(i, i + this.charLimit));
     }
     return result;
   }
-  function merge(parts, breakPart, combineThreshold) {
-    var result = [];
-    var group = {parts: [], charCount: 0};
-    var flush = function() {
+
+  merge(parts, breakPart, combineThreshold) {
+    const result = [];
+    let group = { parts: [], charCount: 0 };
+    const threshold = combineThreshold || this.charLimit;
+    
+    const flush = () => {
       if (group.parts.length) {
-        result.push(group.parts.join(""));
-        group = {parts: [], charCount: 0};
+        result.push(group.parts.join(''));
+        group = { parts: [], charCount: 0 };
       }
     };
-    parts.forEach(function(part) {
-      var charCount = part.length;
-      if (charCount > charLimit) {
+    
+    for (const part of parts) {
+      const charCount = part.length;
+      
+      if (charCount > this.charLimit) {
         flush();
-        var subParts = breakPart(part);
-        for (var i=0; i<subParts.length; i++) result.push(subParts[i]);
-      }
-      else {
-        if (group.charCount + charCount > (combineThreshold || charLimit)) flush();
+        const subParts = breakPart(part);
+        result.push(...subParts);
+      } else {
+        if (group.charCount + charCount > threshold) flush();
         group.parts.push(part);
         group.charCount += charCount;
       }
-    });
+    }
+    
     flush();
     return result;
   }
 }
 
-//punctuators
+// Enhanced Punctuators with better language detection
+class LatinPunctuator {
+  constructor() {
+    // Common abbreviations that shouldn't end sentences
+    this.abbreviations = new Set([
+      'Mr', 'Mrs', 'Ms', 'Dr', 'Prof', 'Rev', 'Hon', 'Capt', 'Col', 'Gen',
+      'Lt', 'Sgt', 'Cpl', 'Ltd', 'Inc', 'Corp', 'Assn', 'Univ', 'Dept',
+      'Jan', 'Feb', 'Mar', 'Apr', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+      'vs', 'vol', 'ed', 'est', 'tel', 'fax', 'e.g', 'i.e', 'et al'
+    ]);
+  }
 
-function LatinPunctuator() {
-  this.getParagraphs = function(text) {
-    return recombine(text.split(/((?:\r?\n\s*){2,})/));
+  getParagraphs(text) {
+    return this.recombine(text.split(/((?:\r?\n\s*){2,})/));
   }
-  this.getSentences = function(text) {
-    return recombine(text.split(/([.!?]+[\s\u200b]+)/), /\b(\w|[A-Z][a-z]|Assn|Ave|Capt|Col|Comdr|Corp|Cpl|Gen|Gov|Hon|Inc|Lieut|Ltd|Rev|Univ|Jan|Feb|Mar|Apr|Aug|Sept|Oct|Nov|Dec|dept|ed|est|vol|vs)\.\s+$/);
+
+  getSentences(text) {
+    const regex = /([.!?]+[\s\u200b]+)/;
+    return this.recombine(text.split(regex), (part) => this.isAbbreviation(part));
   }
-  this.getPhrases = function(sentence) {
-    return recombine(sentence.split(/([,;:]\s+|\s-+\s+|—\s*)/));
+
+  getPhrases(sentence) {
+    return this.recombine(sentence.split(/([,;:]\s+|\s-+\s+|—\s*)/));
   }
-  this.getWords = function(sentence) {
-    var tokens = sentence.trim().split(/([~@#%^*_+=<>]|[\s\-—/]+|\.(?=\w{2,})|,(?=[0-9]))/);
-    var result = [];
-    for (var i=0; i<tokens.length; i+=2) {
+
+  getWords(text) {
+    const tokens = text.trim().split(/([~@#%^*_+=<>]|[\s\-—/]+|\.(?=\w{2,})|,(?=[0-9]))/);
+    const result = [];
+    
+    for (let i = 0; i < tokens.length; i += 2) {
       if (tokens[i]) result.push(tokens[i]);
-      if (i+1 < tokens.length) {
-        if (/^[~@#%^*_+=<>]$/.test(tokens[i+1])) result.push(tokens[i+1]);
-        else if (result.length) result[result.length-1] += tokens[i+1];
+      if (i + 1 < tokens.length && /^[~@#%^*_+=<>]$/.test(tokens[i + 1])) {
+        result.push(tokens[i + 1]);
+      } else if (i + 1 < tokens.length && result.length) {
+        result[result.length - 1] += tokens[i + 1];
       }
     }
+    
     return result;
   }
-  function recombine(tokens, nonPunc) {
-    var result = [];
-    for (var i=0; i<tokens.length; i+=2) {
-      var part = (i+1 < tokens.length) ? (tokens[i] + tokens[i+1]) : tokens[i];
+
+  isAbbreviation(text) {
+    const clean = text.trim().replace(/[.!?]$/, '');
+    return this.abbreviations.has(clean);
+  }
+
+  recombine(tokens, nonPunc = null) {
+    const result = [];
+    
+    for (let i = 0; i < tokens.length; i += 2) {
+      const part = i + 1 < tokens.length ? tokens[i] + tokens[i + 1] : tokens[i];
+      
       if (part) {
-        if (nonPunc && result.length && nonPunc.test(result[result.length-1])) result[result.length-1] += part;
-        else result.push(part);
+        if (nonPunc && result.length && nonPunc(result[result.length - 1])) {
+          result[result.length - 1] += part;
+        } else {
+          result.push(part);
+        }
       }
     }
+    
     return result;
   }
 }
 
-function EastAsianPunctuator() {
-  this.getParagraphs = function(text) {
-    return recombine(text.split(/((?:\r?\n\s*){2,})/));
+class EastAsianPunctuator {
+  getParagraphs(text) {
+    return this.recombine(text.split(/((?:\r?\n\s*){2,})/));
   }
-  this.getSentences = function(text) {
-    return recombine(text.split(/([.!?]+[\s\u200b]+|[\u3002\uff01]+)/));
+
+  getSentences(text) {
+    return this.recombine(text.split(/([.!?]+[\s\u200b]+|[\u3002\uff01]+)/));
   }
-  this.getPhrases = function(sentence) {
-    return recombine(sentence.split(/([,;:]\s+|[\u2025\u2026\u3000\u3001\uff0c\uff1b]+)/));
+
+  getPhrases(sentence) {
+    return this.recombine(sentence.split(/([,;:]\s+|[\u2025\u2026\u3000\u3001\uff0c\uff1b]+)/));
   }
-  this.getWords = function(sentence) {
-    return sentence.replace(/\s+/g, "").split("");
+
+  getWords(sentence) {
+    // For CJK languages, split into individual characters
+    return sentence.replace(/\s+/g, '').split('');
   }
-  function recombine(tokens) {
-    var result = [];
-    for (var i=0; i<tokens.length; i+=2) {
-      if (i+1 < tokens.length) result.push(tokens[i] + tokens[i+1]);
-      else if (tokens[i]) result.push(tokens[i]);
+
+  recombine(tokens) {
+    const result = [];
+    
+    for (let i = 0; i < tokens.length; i += 2) {
+      if (i + 1 < tokens.length) {
+        result.push(tokens[i] + tokens[i + 1]);
+      } else if (tokens[i]) {
+        result.push(tokens[i]);
+      }
     }
+    
     return result;
   }
 }
+
+// Browser TTS Engine wrapper
+class BrowserTtsEngine {
+  constructor(speechSynthesis) {
+    this.speechSynthesis = speechSynthesis;
+    this.currentUtterance = null;
+  }
+
+  speak(text, options, callback) {
+    this.stop();
+    
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = options.lang;
+    utterance.rate = options.rate;
+    utterance.pitch = options.pitch;
+    utterance.volume = options.volume;
+    
+    if (options.voice?.voiceURI) {
+      utterance.voice = options.voice;
+    }
+    
+    utterance.onstart = () => callback({ type: 'start' });
+    utterance.onend = () => callback({ type: 'end' });
+    utterance.onerror = (event) => callback({ type: 'error', errorMessage: event.error });
+    utterance.onboundary = (event) => callback({ type: 'boundary', ...event });
+    
+    this.currentUtterance = utterance;
+    this.speechSynthesis.speak(utterance);
+  }
+
+  stop() {
+    if (this.currentUtterance) {
+      this.speechSynthesis.cancel();
+      this.currentUtterance = null;
+    }
+  }
+
+  pause() {
+    this.speechSynthesis.pause();
+  }
+
+  resume() {
+    this.speechSynthesis.resume();
+  }
+
+  isSpeaking(callback) {
+    callback(this.speechSynthesis.speaking);
+  }
+}
+
+// Timeout TTS Engine wrapper for handling hanging utterances
+class TimeoutTtsEngine {
+  constructor(baseEngine, timeoutMs) {
+    this.baseEngine = baseEngine;
+    this.timeoutMs = timeoutMs;
+    this.timeoutId = null;
+  }
+
+  speak(text, options, callback) {
+    let completed = false;
+    
+    const wrappedCallback = (event) => {
+      if (event.type === 'start' || event.type === 'end') {
+        if (this.timeoutId) {
+          clearTimeout(this.timeoutId);
+          this.timeoutId = null;
+        }
+      }
+      
+      if (event.type === 'end' || event.type === 'error') {
+        completed = true;
+      }
+      
+      callback(event);
+    };
+    
+    this.timeoutId = setTimeout(() => {
+      if (!completed) {
+        console.warn('TTS engine timeout, forcing stop');
+        this.stop();
+        callback({ type: 'error', errorMessage: 'TTS timeout' });
+      }
+    }, this.timeoutMs);
+    
+    this.baseEngine.speak(text, options, wrappedCallback);
+  }
+
+  stop() {
+    if (this.timeoutId) {
+      clearTimeout(this.timeoutId);
+      this.timeoutId = null;
+    }
+    this.baseEngine.stop();
+  }
+
+  pause() {
+    this.baseEngine.pause();
+  }
+
+  resume() {
+    this.baseEngine.resume();
+  }
+
+  isSpeaking(callback) {
+    this.baseEngine.isSpeaking(callback);
+  }
+}
+
+// Export for different environments
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { Speech, WordBreaker, CharBreaker, LatinPunctuator, EastAsianPunctuator };
 }
